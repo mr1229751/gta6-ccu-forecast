@@ -34,6 +34,18 @@ neighbouring hours, and adjusted by a small per-bucket calibration fitted by coo
 descent on leave-one-out forecasts and shrunk by half. The case's hour-1 print scales the
 curves back to viewers.
 
+Two robustness choices matter for the final case specifically. The `ln(v1 / pre12)`
+feature's kernel scale is wide (2.0): the final case's pre-launch window holds a partial
+rolling unlock (New Zealand and Europe live before hour 1) plus an unusually large
+squatting audience, a configuration no pool member shares, and at a narrow scale that
+distance routed the forecast to live-service launches instead of the big rolling-midnight
+tentpoles it resembles. And when a case carries minute reads (the final does; the hourly
+practice data does not), hours 2-4 are anchored part-way to the level of hour 1's last 15
+minutes — hour 2 starts from where hour 1 ended, not from its 60-minute mean — with the
+adjustment clamped and decaying by hour. The five levels are also narrowed geometrically
+around the median (factor 0.92, fitted by leave-one-out): the raw pool spread is slightly
+too wide for the pinball loss.
+
 The program is a pure function of the case file: no randomness, no clock, no network —
 two runs on the same case are byte-identical. Missing or malformed inputs (no hour-1 print,
 no comparables, empty history, null fields) degrade to a persistence-shaped fallback rather

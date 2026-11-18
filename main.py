@@ -1,7 +1,7 @@
 """gta6-twitch-ccu-forecast-01 entry: an hour-by-hour quantile forecaster for a launch day's
 Twitch category viewers, from the case's first-hour print and its pool of past launches.
 
-Method (v2): every comparable launch contributes its release-day curve as log ratios to its
+Method (v4): every comparable launch contributes its release-day curve as log ratios to its
 own hour-1 print, lr_h = ln(v_h) - ln(v_1). The pool is weighted by similarity to the case
 on three launch-state features, all computed the same way for the case and for each
 comparable from its own series: ln(v1) (scale), ln(v1 / pre12) (hour 1 against the mean of
@@ -10,8 +10,15 @@ median of the hours 48..12 before the day). Launches whose hour 1 already holds 
 audience resemble each other; launches whose day has not started at hour 1 do not forecast a
 rolling-midnight console launch. For each hour the forecast's five levels are the weighted
 empirical quantiles of lr_h, shrunk toward a robust normal fit of the same weighted pool
-and lightly smoothed across neighbouring hours; the case's hour-1 print scales them back
-to viewers. Deterministic: the output is a pure function of the case file's bytes.
+and lightly smoothed across neighbouring hours; the five levels are then narrowed
+geometrically around the median (factor SPREAD_S, fitted by leave-one-out: the raw pool
+spread is slightly too wide for the pinball loss); the case's hour-1 print scales them
+back to viewers. The kernel's pre-12h feature uses a wide scale (2.0): the final case's
+pre-launch window holds a partial rolling unlock and a large squatting audience, a
+configuration no pool member shares, and at the original scale it routed the forecast
+to live-service launches instead of the big rolling-midnight tentpoles. When the case
+carries minute reads (the final does; practice data does not), hours 2-4 are also
+anchored part-way to the level of hour 1's last 15 minutes, clamped, decaying by hour. Deterministic: the output is a pure function of the case file's bytes.
 
 Run by the grader as `python3 -P -s /bot/main.py` (Python 3.13, standard library only);
 outside it, MAKEFUN_INPUT_DIR / MAKEFUN_OUTPUT_DIR stand in for /input and /output.
@@ -35,8 +42,12 @@ Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 SHRINK_K = 8.0
 # Similarity kernel: per-feature scales in log space, and the flat-pool blend share.
 # (Scales and blend tuned by leave-one-out over the comparable pool; see README.)
-KERNEL_SCALES = [1.0, 1.2, 1.5]
+KERNEL_SCALES = [1.0, 2.0, 1.5]
 FLAT_BLEND = 0.15
+# Geometric narrowing of the five levels around the median (1.0 = off), fitted by LOO.
+SPREAD_S = 0.92
+# Optional wider factor for the 75% level on hours 6..21 (None = use SPREAD_S there too).
+SPREAD_S75_MID = None  # tested at 1.0/1.05/1.1: all worse, stays off
 # Post-calibration of the log-ratio levels, per hour bucket, fitted by coordinate descent
 # on leave-one-out forecasts over the comparable pool and shrunk by half toward zero: the
 # raw pool quantiles leave the early hours' upper tail slightly narrow.
@@ -221,6 +232,30 @@ def hour_quantile_curves(records, weights):
     return smooth
 
 
+BRIDGE_ALPHA = {2: 0.5, 3: 0.25, 4: 0.1}
+BRIDGE_CLAMP = 0.3
+
+
+def minute_bridge(case, p1):
+    """ln(mean viewers over the last 15 minutes before the checkpoint / hour-1 print),
+    clamped; None when the history has no dense reads there (hourly practice data).
+    Hour 2 physically starts from the level hour 1 ended at, not its 60-minute mean."""
+    cp = parse_ts(case.get("checkpoint"))
+    if cp is None:
+        return None
+    lo = cp - timedelta(minutes=15)
+    vals = []
+    for p in case.get("history") or []:
+        t = parse_ts(p.get("at") or p.get("from"))
+        v = p.get("viewers")
+        if t is not None and lo <= t < cp and isinstance(v, (int, float)) and math.isfinite(v) and v > 0:
+            vals.append(float(v))
+    if len(vals) < 5:
+        return None
+    late = sum(vals) / len(vals)
+    return max(-BRIDGE_CLAMP, min(BRIDGE_CLAMP, math.log(late / p1)))
+
+
 def hour1_print(case):
     for k in case.get("known") or []:
         v = k.get("viewers")
@@ -263,12 +298,20 @@ def forecast_case(case):
             wanted.append(h)
     if len(wanted) != 23:  # a malformed forecast list still owes the full 23 rows
         wanted = list(range(2, 25))
+    bridge = minute_bridge(case, p1)
     rows = []
     for h in wanted:
-        qs = sorted(
-            min(1e9, p1 * math.exp(lr + calib_delta(h, i)))
-            for i, lr in enumerate(curves.get(h, [0.0] * 5))
-        )
+        lrs = [lr + calib_delta(h, i) for i, lr in enumerate(curves.get(h, [0.0] * 5))]
+        if bridge is not None and h in BRIDGE_ALPHA:
+            lrs = [x + BRIDGE_ALPHA[h] * bridge for x in lrs]
+        if SPREAD_S != 1.0 or SPREAD_S75_MID is not None:
+            med = lrs[2]
+            lrs = [
+                med + (SPREAD_S75_MID if (i == 3 and 6 <= h <= 21 and SPREAD_S75_MID is not None)
+                       else SPREAD_S) * (x - med)
+                for i, x in enumerate(lrs)
+            ]
+        qs = sorted(min(1e9, p1 * math.exp(x)) for x in lrs)
         rows.append({"hour": h, "q": [round2(v) for v in qs]})
     rows.sort(key=lambda r: r["hour"])
     return {"hours": rows}
